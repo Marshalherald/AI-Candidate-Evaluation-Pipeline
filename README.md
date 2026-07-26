@@ -9,7 +9,7 @@ Built as part of the **Eubrics Automation Engineer Internship** assignment. This
 
 ## 📸 Workflow Screenshot
 
-![n8n Workflow](docs/images/workflow.png)
+![n8n Workflow](screenshot/workflow.png)
 
 > *The complete n8n canvas showing all 17 nodes — from Google Sheets Trigger through Groq AI evaluation to Gmail alerts.*
 
@@ -17,9 +17,7 @@ Built as part of the **Eubrics Automation Engineer Internship** assignment. This
 
 ## 🏗️ Architecture
 
-![diagram](docs/images/workflow.png)
-
-> *Architecture Diagram.*
+![AI Candidate Evaluation Architecture](screenshot/ai_pipeline_output_layer.png)
 
 ---
 
