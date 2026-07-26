@@ -1,0 +1,348 @@
+
+  "name": "AI Candidate Evaluation Pipeline — Eubrics",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [{ "mode": "everyMinutes", "value": 5 }]
+        },
+        "triggerOn": "rowAdded",
+        "sheetName": "Raw Submissions",
+        "options": {}
+      },
+      "name": "Watch New Submissions",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [80, 300],
+      "notes": "Polls the Raw Submissions tab every 5 minutes. Fires when Google Form adds a new row. Connect your Google Sheets OAuth2 credential and point to your spreadsheet."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "name": "candidateName",   "value": "={{ $json['Full Name'] }}",                              "type": "string" },
+            { "name": "email",           "value": "={{ $json['Email'] }}",                                  "type": "string" },
+            { "name": "college",         "value": "={{ $json['College / Company'] }}",                      "type": "string" },
+            { "name": "githubUrl",       "value": "={{ $json['GitHub Repository URL'] }}",                  "type": "string" },
+            { "name": "videoUrl",        "value": "={{ $json['Loom / YouTube Demo Video URL'] }}",          "type": "string" },
+            { "name": "resumeDriveUrl",  "value": "={{ $json['Google Drive Link for Resume PDF'] }}",       "type": "string" },
+            { "name": "docsUrl",         "value": "={{ $json['Project Documentation URL'] }}",              "type": "string" },
+            { "name": "explanation",     "value": "={{ $json['Assignment Explanation'] }}",                 "type": "string" },
+            { "name": "submittedAt",     "value": "={{ $now.toISO() }}",                                    "type": "string" },
+            { "name": "rowNumber",       "value": "={{ $json['__rowNumber'] }}",                            "type": "number" }
+          ]
+        }
+      },
+      "name": "Normalize Submission Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [280, 300],
+      "notes": "Renames raw Google Form column names into clean camelCase variables used throughout the workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "const url = $json.githubUrl || '';\nconst clean = url.replace('https://github.com/', '').replace(/\\/$/, '');\nconst rawUrl = `https://raw.githubusercontent.com/${clean}/main/README.md`;\nconst apiUrl = `https://api.github.com/repos/${clean}`;\nreturn [{ json: { ...$json, githubRawUrl: rawUrl, githubApiUrl: apiUrl } }];"
+      },
+      "name": "Build GitHub Raw URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "notes": "Converts https://github.com/USER/REPO into the raw README URL and GitHub API URL. Strips trailing slashes."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.githubRawUrl }}",
+        "options": { "response": { "response": { "responseFormat": "text" } } }
+      },
+      "name": "Fetch GitHub README",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 200],
+      "continueOnFail": true,
+      "notes": "Fetches the raw README.md text. continueOnFail=true so missing READMEs don't crash the workflow."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.githubApiUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/vnd.github.v3+json" },
+            { "name": "User-Agent", "value": "n8n-candidate-evaluator" }
+          ]
+        }
+      },
+      "name": "Fetch GitHub Repo Metadata",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 400],
+      "continueOnFail": true,
+      "notes": "Hits the GitHub API for repo metadata: stars, language, topics, description, last updated. No auth needed for public repos (60 req/hr limit)."
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "name": "Merge GitHub Data",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [880, 300],
+      "notes": "Combines README text (Input 1) and repo metadata (Input 2) into one item for the evaluation nodes."
+    },
+    {
+      "parameters": {
+        "jsCode": "const videoUrl = $json.videoUrl || '';\nlet platform = 'unknown';\nlet oembedUrl = '';\nif (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {\n  platform = 'youtube';\n  oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;\n} else if (videoUrl.includes('loom.com')) {\n  platform = 'loom';\n  oembedUrl = `https://www.loom.com/v1/oembed?url=${encodeURIComponent(videoUrl)}`;\n}\nreturn [{ json: { ...$json, videoPlatform: platform, oembedUrl } }];"
+      },
+      "name": "Route Video URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 300],
+      "notes": "Detects whether the video is YouTube or Loom and builds the correct oEmbed URL to fetch title and description."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.oembedUrl }}",
+        "options": {}
+      },
+      "name": "Fetch Video Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1280, 300],
+      "continueOnFail": true,
+      "notes": "Fetches video title and description via oEmbed. Free, no API key needed. continueOnFail=true for missing/private videos."
+    },
+    {
+      "parameters": {
+        "jsCode": "const videoData = $json;\nconst base = $('Merge GitHub Data').first().json;\nreturn [{ json: {\n  ...base,\n  videoPlatform: $('Route Video URL').first().json.videoPlatform || 'unknown',\n  videoTitle: videoData.title || '',\n  videoAuthor: videoData.author_name || '',\n  readmeContent: base.data || base.body || '',\n  repoDescription: base.description || '',\n  repoStars: base.stargazers_count || 0,\n  repoLanguage: base.language || '',\n  repoTopics: (base.topics || []).join(', '),\n  repoUpdatedAt: base.updated_at || ''\n}}];"
+      },
+      "name": "Build Eval Prompts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1480, 300],
+      "notes": "Consolidates all fetched data (README, repo metadata, video info) into a single clean object ready for the three Groq evaluation calls."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "llama3-70b-8192",
+          "temperature": 0.3,
+          "max_tokens": 1000,
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a senior technical recruiter evaluating a candidate's GitHub repository for an Automation Engineer internship. The role requires n8n, Claude AI, workflow design, API integration, and prompt engineering. Evaluate strictly and return ONLY valid JSON. No markdown. No backticks. Just the raw JSON object."
+            },
+            {
+              "role": "user",
+              "content": "=Evaluate this GitHub repository.\n\nCandidate: {{ $json.candidateName }}\nRepo URL: {{ $json.githubUrl }}\nDescription: {{ $json.repoDescription || 'None' }}\nStars: {{ $json.repoStars }}\nLanguage: {{ $json.repoLanguage }}\nTopics: {{ $json.repoTopics }}\nLast Updated: {{ $json.repoUpdatedAt }}\n\nREADME (first 3000 chars):\n{{ ($json.readmeContent || 'No README found').substring(0, 3000) }}\n\nReturn this exact JSON (no markdown, no backticks):\n{\n  \"readme_quality\": 0,\n  \"code_structure\": 0,\n  \"documentation\": 0,\n  \"automation_relevance\": 0,\n  \"innovation\": 0,\n  \"completeness\": 0,\n  \"github_score\": 0,\n  \"github_strengths\": [\"example strength\"],\n  \"github_weaknesses\": [\"example weakness\"],\n  \"github_summary\": \"one sentence summary\"\n}"
+            }
+          ]
+        }
+      },
+      "name": "Evaluate GitHub",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1680, 300],
+      "continueOnFail": true,
+      "notes": "Calls Groq (Llama 3 70B) to score the GitHub repo across 6 dimensions. Attach your Groq HTTP Header Auth credential here."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "llama3-70b-8192",
+          "temperature": 0.3,
+          "max_tokens": 1000,
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a senior recruiter evaluating a candidate's communication skills and technical thinking. Return ONLY valid JSON. No markdown. No backticks."
+            },
+            {
+              "role": "user",
+              "content": "Evaluate this automation engineer intern candidate.\n\nCandidate: {{ $json.candidateName }}\nCollege: {{ $json.college }}\n\nWritten explanation of their project:\n{{ $json.explanation }}\n\nVideo platform: {{ $json.videoPlatform }}\nVideo title: {{ $json.videoTitle || 'Not available' }}\n\nReturn this exact JSON (no markdown, no backticks):\n{\n  \"communication_score\": 0,\n  \"clarity_score\": 0,\n  \"technical_depth_score\": 0,\n  \"architecture_thinking_score\": 0,\n  \"video_score\": 0,\n  \"comm_strengths\": [\"example strength\"],\n  \"comm_weaknesses\": [\"example weakness\"],\n  \"comm_summary\": \"one sentence summary\"\n}"
+            }
+          ]
+        }
+      },
+      "name": "Evaluate Assignment Explanation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1880, 300],
+      "continueOnFail": true,
+      "notes": "Calls Groq to score the written assignment explanation and video. Same credential as Evaluate GitHub."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "llama3-70b-8192",
+          "temperature": 0.3,
+          "max_tokens": 1200,
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a Principal Recruiter at Eubrics, an AI coaching and automation company. You are evaluating candidates for an Automation Engineer Internship requiring n8n, Claude, AI automation, workflow design, system thinking, API integration, and prompt engineering. Return ONLY valid JSON. No markdown. No backticks."
+            },
+            {
+              "role": "user",
+              "content": "Generate the final evaluation for this candidate.\n\nName: {{ $json.candidateName }}\nEmail: {{ $json.email }}\nCollege: {{ $json.college }}\nGitHub: {{ $json.githubUrl }}\nVideo: {{ $json.videoUrl }}\n\nSCORES FROM EARLIER EVALUATION:\nGitHub Score: {{ $json.github_score }}/10\nReadme Quality: {{ $json.readme_quality }}/10\nAutomation Relevance: {{ $json.automation_relevance }}/10\nInnovation: {{ $json.innovation }}/10\nCommunication Score: {{ $json.communication_score }}/10\nTechnical Depth: {{ $json.technical_depth_score }}/10\nArchitecture Thinking: {{ $json.architecture_thinking_score }}/10\nVideo Score: {{ $json.video_score }}/10\n\nGitHub Summary: {{ $json.github_summary }}\nComm Summary: {{ $json.comm_summary }}\n\nReturn ONLY this JSON:\n{\n  \"overall_score\": 0,\n  \"resume_score\": 0,\n  \"github_score\": 0,\n  \"video_score\": 0,\n  \"communication_score\": 0,\n  \"technical_score\": 0,\n  \"innovation_score\": 0,\n  \"architecture_score\": 0,\n  \"automation_thinking_score\": 0,\n  \"business_value_score\": 0,\n  \"verdict\": \"Strong Hire\",\n  \"top_strengths\": [\"strength 1\", \"strength 2\", \"strength 3\"],\n  \"top_weaknesses\": [\"weakness 1\", \"weakness 2\"],\n  \"recommendations\": [\"recommendation 1\", \"recommendation 2\"],\n  \"hiring_summary\": \"2-3 sentence paragraph for the recruiter\",\n  \"interview_focus_areas\": [\"area 1\", \"area 2\"]\n}"
+            }
+          ]
+        }
+      },
+      "name": "Final Holistic Evaluation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2080, 300],
+      "continueOnFail": true,
+      "notes": "Master evaluation node. Receives all prior scores as context and generates the final verdict (Strong Hire / Hire / Maybe / Reject) plus all subscores."
+    },
+    {
+      "parameters": {
+        "jsCode": "function safeParseJson(text) {\n  const clean = (text || '').replace(/```json/g, '').replace(/```/g, '').trim();\n  try { return JSON.parse(clean); } catch(e) { return {}; }\n}\n\nconst githubRaw = $('Evaluate GitHub').first().json;\nconst commRaw   = $('Evaluate Assignment Explanation').first().json;\nconst finalRaw  = $('Final Holistic Evaluation').first().json;\nconst base      = $('Build Eval Prompts').first().json;\n\nconst github = safeParseJson(githubRaw.choices?.[0]?.message?.content);\nconst comm   = safeParseJson(commRaw.choices?.[0]?.message?.content);\nconst final  = safeParseJson(finalRaw.choices?.[0]?.message?.content);\n\nreturn [{ json: {\n  ...base,\n  ...github,\n  ...comm,\n  ...final,\n  evaluatedAt: new Date().toISOString()\n}}];"
+      },
+      "name": "Parse and Merge Scores",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2280, 300],
+      "notes": "Strips any markdown backticks Groq may have added, parses all three JSON responses, and merges them into one flat object for Google Sheets."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "sheetName": "Evaluations",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date":                 "={{ $json.submittedAt }}",
+            "Candidate":            "={{ $json.candidateName }}",
+            "Email":                "={{ $json.email }}",
+            "College":              "={{ $json.college }}",
+            "GitHub URL":           "={{ $json.githubUrl }}",
+            "Video URL":            "={{ $json.videoUrl }}",
+            "Overall Score":        "={{ $json.overall_score }}",
+            "GitHub Score":         "={{ $json.github_score }}",
+            "Communication":        "={{ $json.communication_score }}",
+            "Technical":            "={{ $json.technical_score }}",
+            "Innovation":           "={{ $json.innovation_score }}",
+            "Architecture":         "={{ $json.architecture_score }}",
+            "Automation Thinking":  "={{ $json.automation_thinking_score }}",
+            "Business Value":       "={{ $json.business_value_score }}",
+            "Video Score":          "={{ $json.video_score }}",
+            "Verdict":              "={{ $json.verdict }}",
+            "Top Strengths":        "={{ $json.top_strengths?.join('; ') }}",
+            "Top Weaknesses":       "={{ $json.top_weaknesses?.join('; ') }}",
+            "Recommendations":      "={{ $json.recommendations?.join('; ') }}",
+            "Hiring Summary":       "={{ $json.hiring_summary }}",
+            "Interview Focus":      "={{ $json.interview_focus_areas?.join('; ') }}",
+            "Evaluated At":         "={{ $json.evaluatedAt }}"
+          }
+        }
+      },
+      "name": "Log to Evaluation Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2480, 300],
+      "notes": "Appends one scored row to the Evaluations tab. Connect your Google Sheets credential and set the Spreadsheet ID."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.verdict }}",
+              "operation": "contains",
+              "value2": "Hire"
+            }
+          ]
+        }
+      },
+      "name": "Route by Verdict",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2680, 300],
+      "notes": "Routes Strong Hire and Hire candidates to the recruiter alert. All candidates get the acknowledgement email."
+    },
+    {
+      "parameters": {
+        "sendTo": "RECRUITER_EMAIL_HERE",
+        "subject": "={{ $json.verdict === 'Strong Hire' ? '🌟' : '✅' }} {{ $json.verdict }}: {{ $json.candidateName }} — {{ $json.overall_score }}/10",
+        "emailType": "html",
+        "message": "<h2 style='color:#1a2b4a'>{{ $json.verdict }}: {{ $json.candidateName }}</h2><p><strong>Overall Score:</strong> {{ $json.overall_score }}/10 &nbsp;|&nbsp; <strong>College:</strong> {{ $json.college }}</p><p><strong>GitHub:</strong> <a href='{{ $json.githubUrl }}'>{{ $json.githubUrl }}</a><br><strong>Demo:</strong> <a href='{{ $json.videoUrl }}'>{{ $json.videoUrl }}</a></p><h3>Score Breakdown</h3><table border='1' cellpadding='8' cellspacing='0' style='border-collapse:collapse;font-size:14px'><tr style='background:#1a2b4a;color:white'><th>Dimension</th><th>Score</th></tr><tr><td>Technical</td><td>{{ $json.technical_score }}/10</td></tr><tr style='background:#f8fafc'><td>GitHub</td><td>{{ $json.github_score }}/10</td></tr><tr><td>Communication</td><td>{{ $json.communication_score }}/10</td></tr><tr style='background:#f8fafc'><td>Innovation</td><td>{{ $json.innovation_score }}/10</td></tr><tr><td>Architecture</td><td>{{ $json.architecture_score }}/10</td></tr><tr style='background:#f8fafc'><td>Automation Thinking</td><td>{{ $json.automation_thinking_score }}/10</td></tr><tr><td>Business Value</td><td>{{ $json.business_value_score }}/10</td></tr><tr><td>Video</td><td>{{ $json.video_score }}/10</td></tr></table><h3>Top Strengths</h3><ul>{{ $json.top_strengths?.map(s => '<li>' + s + '</li>').join('') }}</ul><h3>Areas to Improve</h3><ul>{{ $json.top_weaknesses?.map(w => '<li>' + w + '</li>').join('') }}</ul><h3>Recommendations</h3><ul>{{ $json.recommendations?.map(r => '<li>' + r + '</li>').join('') }}</ul><h3>Recruiter Summary</h3><p>{{ $json.hiring_summary }}</p><h3>Interview Focus Areas</h3><ul>{{ $json.interview_focus_areas?.map(a => '<li>' + a + '</li>').join('') }}</ul><hr><p style='color:#888;font-size:12px'>Auto-generated by AI Candidate Evaluation Pipeline</p>",
+        "options": {}
+      },
+      "name": "Send Recruiter Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2880, 200],
+      "notes": "Sends a rich HTML email to the recruiter for Strong Hire and Hire candidates. Replace RECRUITER_EMAIL_HERE with the actual address."
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "subject": "We received your Eubrics assignment, {{ $json.candidateName.split(' ')[0] }}!",
+        "emailType": "html",
+        "message": "<p>Hi {{ $json.candidateName.split(' ')[0] }},</p><p>Thank you for submitting your assignment for the <strong>Automation Engineer</strong> role at Eubrics.</p><p>We have received your submission and our team will review it shortly. We will be in touch regarding next steps.</p><p>Best regards,<br><strong>The Eubrics Team</strong></p>",
+        "options": {}
+      },
+      "name": "Acknowledge Candidate",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2880, 400],
+      "notes": "Sends a confirmation email to every candidate. Fires regardless of verdict."
+    }
+  ],
+  "connections": {
+    "Watch New Submissions":        { "main": [[{ "node": "Normalize Submission Data",      "type": "main", "index": 0 }]] },
+    "Normalize Submission Data":    { "main": [[{ "node": "Build GitHub Raw URL",           "type": "main", "index": 0 }]] },
+    "Build GitHub Raw URL":         { "main": [[{ "node": "Fetch GitHub README",            "type": "main", "index": 0 }, { "node": "Fetch GitHub Repo Metadata", "type": "main", "index": 0 }]] },
+    "Fetch GitHub README":          { "main": [[{ "node": "Merge GitHub Data",              "type": "main", "index": 0 }]] },
+    "Fetch GitHub Repo Metadata":   { "main": [[{ "node": "Merge GitHub Data",              "type": "main", "index": 1 }]] },
+    "Merge GitHub Data":            { "main": [[{ "node": "Route Video URL",                "type": "main", "index": 0 }]] },
+    "Route Video URL":              { "main": [[{ "node": "Fetch Video Info",               "type": "main", "index": 0 }]] },
+    "Fetch Video Info":             { "main": [[{ "node": "Build Eval Prompts",             "type": "main", "index": 0 }]] },
+    "Build Eval Prompts":           { "main": [[{ "node": "Evaluate GitHub",               "type": "main", "index": 0 }]] },
+    "Evaluate GitHub":              { "main": [[{ "node": "Evaluate Assignment Explanation","type": "main", "index": 0 }]] },
+    "Evaluate Assignment Explanation": { "main": [[{ "node": "Final Holistic Evaluation",  "type": "main", "index": 0 }]] },
+    "Final Holistic Evaluation":    { "main": [[{ "node": "Parse and Merge Scores",        "type": "main", "index": 0 }]] },
+    "Parse and Merge Scores":       { "main": [[{ "node": "Log to Evaluation Sheet",       "type": "main", "index": 0 }]] },
+    "Log to Evaluation Sheet":      { "main": [[{ "node": "Route by Verdict",              "type": "main", "index": 0 }]] },
+    "Route by Verdict":             {
+      "main": [
+        [{ "node": "Send Recruiter Alert",  "type": "main", "index": 0 }],
+        [{ "node": "Acknowledge Candidate", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Recruiter Alert":         { "main": [[{ "node": "Acknowledge Candidate",         "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["eubrics", "hiring", "automation", "ai"],
+  "meta": {
+    "instanceId": "eubrics-candidate-pipeline-v1"
+  }
+}
